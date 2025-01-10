@@ -1,5 +1,6 @@
 package main
 
+//remove socat .use go options
 import (
 	"crypto/tls"
 	"encoding/binary"
@@ -9,11 +10,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,11 +33,11 @@ type Config struct {
 
 // ButtonConfig maps button numbers to actions
 type ButtonConfig struct {
-	Play      uint8 `json:"play"`
-	Next      uint8 `json:"next"`
-	Previous  uint8 `json:"previous"`
-	Stop      uint8 `json:"stop"`
-	VolumeUp  uint8 `json:"volume_up"`
+	Play       uint8 `json:"play"`
+	Next       uint8 `json:"next"`
+	Previous   uint8 `json:"previous"`
+	Stop       uint8 `json:"stop"`
+	VolumeUp   uint8 `json:"volume_up"`
 	VolumeDown uint8 `json:"volume_down"`
 }
 
@@ -58,6 +62,8 @@ var (
 	currentIdx int
 	currentVol int = 50
 	config     Config
+	mpvSocket  string = "/tmp/mpv-socket"
+	version    string = "1.0.0"
 )
 
 // DefaultConfig returns the default configuration
@@ -109,6 +115,7 @@ func LoadConfig(configPath string) error {
 		return fmt.Errorf("error writing default config: %v", err)
 	}
 
+	log.Printf("Created default config file at: %s\n", configPath)
 	return nil
 }
 
@@ -142,52 +149,83 @@ func FetchRadioStations(apiURL string) ([]RadioStation, error) {
 	return fetchedStations, nil
 }
 
-// StartMPV starts the mpv process with the given stream URL
-func StartMPV(url string) error {
-	mpvMutex.Lock()
-	defer mpvMutex.Unlock()
-
-	if mpvCmd != nil && mpvCmd.Process != nil {
-		mpvCmd.Process.Kill()
+// SendMPVCommand sends a command to the running mpv process via Unix domain socket
+func SendMPVCommand(command string) error {
+	// Ensure command ends with newline
+	if command[len(command)-1] != '\n' {
+		command += "\n"
 	}
 
-	mpvCmd = exec.Command("mpv", "--no-video", "--idle=yes", "--input-ipc-server=/tmp/mpv-socket", url)
-	if err := mpvCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start mpv: %v", err)
+	// Connect to MPV's Unix domain socket
+	conn, err := net.Dial("unix", mpvSocket)
+	if err != nil {
+		return fmt.Errorf("failed to connect to MPV socket: %v", err)
+	}
+	defer conn.Close()
+
+	// Write command to socket
+	if _, err := conn.Write([]byte(command)); err != nil {
+		return fmt.Errorf("failed to write to MPV socket: %v", err)
+	}
+
+	// Read response
+	response := make([]byte, 1024)
+	_, err = conn.Read(response)
+	if err != nil && err != io.EOF {
+		log.Printf("Warning: couldn't read MPV response: %v", err)
 	}
 
 	return nil
 }
 
-// SendMPVCommand sends a command to the running mpv process via IPC
-func SendMPVCommand(command string) error {
-	cmd := exec.Command("socat", "-", "/tmp/mpv-socket")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdin pipe: %v", err)
+// StartMPV starts the mpv process with the given stream URL
+func StartMPV(url string) error {
+	mpvMutex.Lock()
+	defer mpvMutex.Unlock()
+
+	// Kill existing mpv process if it's running
+	if mpvCmd != nil && mpvCmd.Process != nil {
+		mpvCmd.Process.Kill()
+		mpvCmd.Wait()
 	}
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start socat: %v", err)
+	// Remove existing socket if it exists
+	os.Remove(mpvSocket)
+
+	// Start a new mpv process
+	mpvCmd = exec.Command("mpv", "--no-video", "--idle=yes", fmt.Sprintf("--input-ipc-server=%s", mpvSocket), url)
+	if err := mpvCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start mpv: %v", err)
 	}
 
-	if _, err = fmt.Fprintln(stdin, command); err != nil {
-		return fmt.Errorf("failed to write to stdin: %v", err)
+	// Wait for socket to be created
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(mpvSocket); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	stdin.Close()
-	return cmd.Wait()
+	// Set initial volume
+	time.Sleep(500 * time.Millisecond)
+	if err := AdjustVolume(0); err != nil {
+		log.Printf("Warning: couldn't set initial volume: %v", err)
+	}
+
+	return nil
 }
 
 // PlayNextStation switches to the next station in the list
 func PlayNextStation() error {
 	currentIdx = (currentIdx + 1) % len(stations)
+	log.Printf("Playing next station: %s\n", stations[currentIdx].Name)
 	return StartMPV(stations[currentIdx].URL)
 }
 
 // PlayPrevStation switches to the previous station in the list
 func PlayPrevStation() error {
 	currentIdx = (currentIdx - 1 + len(stations)) % len(stations)
+	log.Printf("Playing previous station: %s\n", stations[currentIdx].Name)
 	return StartMPV(stations[currentIdx].URL)
 }
 
@@ -200,13 +238,14 @@ func AdjustVolume(delta int) error {
 		currentVol = 100
 	}
 
-	command := fmt.Sprintf(`{"command": ["set_property", "volume", %d]}`, currentVol)
+	command := fmt.Sprintf(`{ "command": ["set_property", "volume", %d] }`, currentVol)
 	return SendMPVCommand(command)
 }
 
 // StopPlayer sends the stop command to MPV
 func StopPlayer() error {
-	return SendMPVCommand(`{"command": ["stop"]}`)
+	log.Println("Stopping playback")
+	return SendMPVCommand(`{ "command": ["stop"] }`)
 }
 
 // StartGamepadListener starts listening for gamepad events
@@ -263,8 +302,20 @@ func processGamepadEvent(event JoystickEvent) {
 func setupServer() *gin.Engine {
 	r := gin.Default()
 
+	// Add version endpoint
+	r.GET("/version", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"version": version})
+	})
+
 	r.GET("/stations", func(c *gin.Context) {
 		c.JSON(http.StatusOK, stations)
+	})
+
+	r.GET("/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"current_station": stations[currentIdx].Name,
+			"volume":          currentVol,
+		})
 	})
 
 	r.POST("/play", func(c *gin.Context) {
@@ -319,12 +370,18 @@ func setupServer() *gin.Engine {
 }
 
 func main() {
+	log.Printf("Radiopad v%s starting...\n", version)
+
 	// Parse command line flags
-	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "radio-controller", "config.json"), "Path to config file")
+	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "radiopad", "config.json"), "Path to config file")
 	serverPort := flag.String("port", "", "Server port (overrides config file)")
 	gamepadDevice := flag.String("gamepad", "", "Gamepad device path (overrides config file)")
 	stationsAPI := flag.String("api", "", "Stations API URL (overrides config file)")
+	socketPath := flag.String("socket", "/tmp/mpv-socket", "MPV socket path")
 	flag.Parse()
+
+	// Update MPV socket path
+	mpvSocket = *socketPath
 
 	// Load configuration
 	if err := LoadConfig(*configPath); err != nil {
@@ -348,10 +405,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to fetch radio stations: %v", err)
 	}
+	log.Printf("Loaded %d radio stations\n", len(stations))
 
-	// Create quit channel for graceful shutdown
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Create quit channel for gamepad listener
 	quit := make(chan struct{})
-	defer close(quit)
 
 	// Start gamepad listener in a goroutine
 	go func() {
